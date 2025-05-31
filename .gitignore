@@ -152,3 +152,8 @@ dmypy.json
 /data/
 
 *.zip
+
+.vscode/*
+example_data/*
+
+*.mp4
