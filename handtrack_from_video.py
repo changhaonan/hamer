@@ -222,7 +222,7 @@ def hand_heurstic_filter(hand_landmarks, handedness, body_keypoints, img_size, u
     # If the difference is too large, we will filter it
     hand_dir_before = hand_bbox_center - hand_root_kp
     hand_dir_after = hand_bbox_center - hand_root
-    hand_angle_diff = 1.0 - np.abs(np.dot(hand_dir_before, hand_dir_after) / (np.linalg.norm(hand_dir_before) * np.linalg.norm(hand_dir_after)))
+    hand_angle_diff = 1.0 - np.dot(hand_dir_before, hand_dir_after) / (np.linalg.norm(hand_dir_before) * np.linalg.norm(hand_dir_after))
     if use_hand_angle and hand_angle_diff > filter_config.get("max_hand_angle_diff", 0.5):
         return True, filter_log
 
@@ -595,52 +595,13 @@ def hand_filtering(frame, hand_kpts_2d, handedness, body_keypoints, img_size, mp
     return frame, hand_kpts_2d, handedness
 
 
-def raw_process():
-    parser = argparse.ArgumentParser(description="HaMeR video demo code")
-    parser.add_argument(
-        "--checkpoint",
-        type=str,
-        default=DEFAULT_CHECKPOINT,
-        help="Path to pretrained model checkpoint",
-    )
-    parser.add_argument(
-        "--video_path",
-        type=str,
-        default="/home/haonan/Project/hamer/example_data/test_008/raw_data/camera/camera_0.mp4",
-        help="Path to input video file",
-    )
-    parser.add_argument(
-        "--out_path",
-        type=str,
-        default="/home/haonan/Project/hamer/example_data/test_008/handtrack/camera_0_hamer.mp4",
-        help="Path to output video file",
-    )
-    parser.add_argument(
-        "--rescale_factor", type=float, default=2.0, help="Factor for padding the bbox"
-    )
-    parser.add_argument(
-        "--body_detector",
-        type=str,
-        default="regnety",
-        choices=["vitdet", "regnety"],
-        help="Using regnety improves runtime and reduces memory",
-    )
-    parser.add_argument(
-        "--fps",
-        type=int,
-        default=None,
-        help="Output video FPS. If not set, uses input video FPS",
-    )
-    parser.add_argument(
-        "--max_frames",
-        type=int,
-        default=None,
-        help="Maximum number of frames to process",
-    )
-    args = parser.parse_args()
+def raw_process(raw_data_folder):
+    checkpoint = DEFAULT_CHECKPOINT
+    video_path = os.path.join(raw_data_folder, "raw_data", "camera", "camera_0.mp4")
+    body_detector = "regnety"  # "vitdet"
     # Download and load checkpoints
     download_models(CACHE_DIR_HAMER)
-    model, model_cfg = load_hamer(args.checkpoint)
+    model, model_cfg = load_hamer(checkpoint)
 
     # Setup HaMeR model
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
@@ -650,7 +611,7 @@ def raw_process():
     # Load detector
     from hamer.utils.utils_detectron2 import DefaultPredictor_Lazy
 
-    if args.body_detector == "vitdet":
+    if body_detector == "vitdet":
         from detectron2.config import LazyConfig
         import hamer
 
@@ -664,7 +625,7 @@ def raw_process():
         for i in range(3):
             detectron2_cfg.model.roi_heads.box_predictors[i].test_score_thresh = 0.25
         detector = DefaultPredictor_Lazy(detectron2_cfg)
-    elif args.body_detector == "regnety":
+    elif body_detector == "regnety":
         from detectron2 import model_zoo
         from detectron2.config import get_cfg
 
@@ -684,19 +645,15 @@ def raw_process():
     #     process_image(model, model_cfg, detector, cpm, frame, device, args)
     # Read video
     frame_idx = 0
-    video_path = args.video_path
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"Video file {video_path} not found")
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise IOError(f"Error: Could not open video file {video_path}")
     # Output video writer
-    out_video_path = args.out_path
     # Create output folder
-    output_folder = Path(out_video_path).parent
-    output_folder.mkdir(parents=True, exist_ok=True)
-    width, height = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    out_video = cv2.VideoWriter(out_video_path, cv2.VideoWriter_fourcc(*'mp4v'), 30, (width, height))
+    output_folder = os.path.join(raw_data_folder, "handtrack")
+    os.makedirs(output_folder, exist_ok=True)
 
     pbar = tqdm(total=cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frame_idxes = []
@@ -716,9 +673,8 @@ def raw_process():
         if frame_idx < start_frame_idx or frame_idx > end_frame_idx:
             frame_idx += 1
             continue
-        debug_image_path = os.path.join(Path(out_video_path).parent, "debug_images", f"frame_{frame_idx}")
+        debug_image_path = os.path.join(output_folder, "debug_images", f"frame_{frame_idx}")
         kpts_vis_img_hammer, pred_keypoints_2ds_frame, handedness_frame, body_keypoints_list_frame = process_image(model, model_cfg, detector, cpm, frame, device, output_name=debug_image_path, debug_vis=True)
-        out_video.write(kpts_vis_img_hammer)
         # Add to the output
         pred_keypoints_2ds_video.append(pred_keypoints_2ds_frame)
         handedness_video.append(handedness_frame)
@@ -728,9 +684,8 @@ def raw_process():
         pbar.update(1)
     pbar.close()
     cap.release()
-    out_video.release()
     # Save landmarks
-    save_episode_data(frame_idxes, pred_keypoints_2ds_video, handedness_video, body_keypoints_list_video, output_path=out_video_path)
+    save_episode_data(frame_idxes, pred_keypoints_2ds_video, handedness_video, body_keypoints_list_video, output_path=os.path.join(output_folder, "camera_0_hamer_landmarks.json"))
 
 
 def post_process(raw_hand_track_path, output_path):
@@ -741,8 +696,8 @@ def post_process(raw_hand_track_path, output_path):
         "use_body_keypoints": True,
         "min_area_threshold": 2000,  # pixel square
         "min_edge_ratio": 0.6,
-        "min_wrist_kp_conf": 80,
-        "min_hand_root_kp_conf": 80,
+        "min_wrist_kp_conf": 70,  # Set between 70~80%
+        "min_hand_root_kp_conf": 70,  # Set between 70~80%
         "max_wrist_hand_dist": 100,
         "max_root_x_ratio": 3 / 4,
         "min_root_x_ratio": 1 / 4,
@@ -799,7 +754,7 @@ def post_process(raw_hand_track_path, output_path):
         # Add to the output
         frame_data["landmarks"] = [h.tolist() for h in hand_kpts_2d]
         frame_data["handedness"] = handedness
-        out_video.write(frame[bottom_clip:, :])
+        out_video.write(frame[:-bottom_clip, :])
         pbar.update(1)
     pbar.close()
     out_video.release()
@@ -809,7 +764,8 @@ def post_process(raw_hand_track_path, output_path):
 
 if __name__ == "__main__":
     # Generate raw data
-    # raw_process()
-    raw_hand_track_path = "/home/haonan/Project/hamer/example_data/test_008/handtrack/camera_0_hamer_landmarks.json"
-    output_path = "/home/haonan/Project/hamer/example_data/test_008/handtrack/camera_0_hamer_landmarks_filtered.json"
+    raw_data_folder = "/home/haonan/Project/hamer/example_data/test_008"
+    raw_hand_track_path = os.path.join(raw_data_folder, "handtrack", "camera_0_hamer_landmarks.json")
+    output_path = os.path.join(raw_data_folder, "handtrack", "camera_0_hamer_landmarks_filtered.json")
+    # raw_process(raw_data_folder)
     post_process(raw_hand_track_path, output_path)
