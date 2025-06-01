@@ -763,9 +763,15 @@ def post_process(raw_hand_track_path, output_path):
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--raw_data_folder", type=str, default="/home/haonan/Project/hamer/example_data/test_008")
+    parser.add_argument("--redo_raw_process", action="store_true")
+    args = parser.parse_args()
     # Generate raw data
-    raw_data_folder = "/home/haonan/Project/hamer/example_data/test_008"
+    raw_data_folder = args.raw_data_folder
     raw_hand_track_path = os.path.join(raw_data_folder, "handtrack", "camera_0_hamer_landmarks.json")
     output_path = os.path.join(raw_data_folder, "handtrack", "camera_0_hamer_landmarks_filtered.json")
-    # raw_process(raw_data_folder)
+    if args.redo_raw_process:
+        raw_process(raw_data_folder)
     post_process(raw_hand_track_path, output_path)

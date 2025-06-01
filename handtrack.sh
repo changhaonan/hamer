@@ -4,12 +4,12 @@
 export DATA_DIR=/home/haonan/Project/hamer/example_data
 
 for folder in $DATA_DIR/*; do
-    if [ -d "$folder" ] && [ "$folder" != "$DATA_DIR/calibration" ] && [ "$folder" != "$DATA_DIR/test_001" ]; then
+    if [ -d "$folder" ] && [ "$folder" != "$DATA_DIR/calibration" ]; then
         echo "Processing folder: $folder"
         export DATA_SEQ=$folder
 
         # Hand tracking
         echo "Start hand tracking"
-        python handtrack_from_video.py --video_path $DATA_SEQ/raw_data/camera/camera_0.mp4 --out_path $DATA_SEQ/handtrack/camera_0_hamer.mp4
+        python handtrack_from_video.py --raw_data_folder $DATA_SEQ --redo_raw_process
     fi
 done
