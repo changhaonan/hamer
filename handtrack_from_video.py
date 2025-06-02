@@ -1,8 +1,8 @@
 """
-This script is used to detect the hand keypoints from the image.
+This script is used to detect the hand keypoints from the video.
 
 Usage:
-python demo_img_kpts.py --checkpoint /path/to/checkpoint --video_path /path/to/video --out_path /path/to/output
+python handtrack_from_video.py --raw_data_folder /path/to/raw_data_folder --redo_raw_process
 
 """
 from pathlib import Path
@@ -20,7 +20,6 @@ from hamer.configs import CACHE_DIR_HAMER
 from hamer.models import HAMER, download_models, load_hamer, DEFAULT_CHECKPOINT
 from hamer.utils import recursive_to
 from hamer.datasets.vitdet_dataset import ViTDetDataset, DEFAULT_MEAN, DEFAULT_STD
-
 from vitpose_model import ViTPoseModel
 
 # Define hand connections (same as in hand_track.py)
@@ -50,6 +49,7 @@ HAND_CONNECTIONS = [
     (9, 13),
     (13, 17),  # palm connections
 ]
+
 
 def recovery_kpts(kpts_2d, bboxes, img_size, is_right):
     """Recovery the keypoints from the image size to the original image size
@@ -192,7 +192,7 @@ def hand_similarity(left_hand_landmarks, right_hand_landmarks, img_size):
     return distance, iou
 
 
-def hand_heurstic_filter(hand_landmarks, handedness, body_keypoints, img_size, use_body_keypoints=True, use_area=True, use_edge=True, use_direction=True, use_hand_angle=True, filter_config={}):
+def hand_heurstic_filter(hand_landmarks, handedness, body_keypoints, img_size, use_body_keypoints=True, use_area=True, use_edge=True, use_direction=True, use_hand_angle=True, use_hand_anchor=True, filter_config={}):
     """
     Filter out the hand that are too small, too close to the edge, or not pointing to the center of the image.
     """
@@ -213,9 +213,6 @@ def hand_heurstic_filter(hand_landmarks, handedness, body_keypoints, img_size, u
     wrist_hand_dist = np.linalg.norm(wrist_kp - hand_root_kp)
     wrist_kp_conf = body_keypoints[9, 2] if handedness.lower() == "left" else body_keypoints[10, 2]  # Wrist keypoint confidence
     hand_root_kp_conf = body_keypoints[-42, 2] if handedness.lower() == "left" else body_keypoints[-21, 2]  # Hand root keypoint confidence
-    if use_body_keypoints:
-        if wrist_kp_conf < filter_config.get("min_wrist_kp_conf", 60) or hand_root_kp_conf < filter_config.get("min_hand_root_kp_conf", 60) or wrist_hand_dist > filter_config.get("max_wrist_hand_dist", 100):
-            return True, filter_log
     
     # Hand angle filter
     # Calculate the hand angle before hand reconstruction and after hand reconstruction
@@ -223,30 +220,43 @@ def hand_heurstic_filter(hand_landmarks, handedness, body_keypoints, img_size, u
     hand_dir_before = hand_bbox_center - hand_root_kp
     hand_dir_after = hand_bbox_center - hand_root
     hand_angle_diff = 1.0 - np.dot(hand_dir_before, hand_dir_after) / (np.linalg.norm(hand_dir_before) * np.linalg.norm(hand_dir_after))
-    if use_hand_angle and hand_angle_diff > filter_config.get("max_hand_angle_diff", 0.5):
-        return True, filter_log
+
+    # Hand anchor filter
+    # Compute the distance of hand root before and after hand reconstruction
+    hand_root_dist = np.linalg.norm(hand_root - hand_root_kp)
 
     # Edge filter
     # Filter if more than 30% of the hand is outside the image
     hand_bbox_full = np.array([hand_landmarks[idx_exclude_thumb, 0].min(), hand_landmarks[idx_exclude_thumb, 1].min(), hand_landmarks[idx_exclude_thumb, 0].max(), hand_landmarks[idx_exclude_thumb, 1].max()])
     hand_bbox_full_area = (hand_bbox_full[2] - hand_bbox_full[0]) * (hand_bbox_full[3] - hand_bbox_full[1])
     edge_ratio = hand_bbox_area / hand_bbox_full_area
-    if use_edge and edge_ratio < filter_config.get("min_edge_ratio", 0.7):
-        # Filter out the hand that are too close to the edge
-        return True, filter_log
-    
-    # Area filter
-    if use_area and hand_bbox_full_area < filter_config.get("min_area_threshold", 4000):
-        # Filter out the hand that are too small
-        return True, filter_log
     
     # Handness filter
+    to_filter = False
+    if use_body_keypoints:
+        if wrist_kp_conf < filter_config.get("min_wrist_kp_conf", 60) or hand_root_kp_conf < filter_config.get("min_hand_root_kp_conf", 60) or wrist_hand_dist > filter_config.get("max_wrist_hand_dist", 100):
+            to_filter = True
+    
+    if use_hand_angle and hand_angle_diff > filter_config.get("max_hand_angle_diff", 0.5):
+        to_filter = True
+    
+    if use_hand_anchor and hand_root_dist > filter_config.get("max_hand_root_dist", 200):
+        to_filter = True
+
+    if use_edge and edge_ratio < filter_config.get("min_edge_ratio", 0.7):
+        # Filter out the hand that are too close to the edge
+        to_filter = True
+
+    if use_area and hand_bbox_full_area < filter_config.get("min_area_threshold", 4000):
+        # Filter out the hand that are too small
+        to_filter = True
+    
     # If it is left hand, we will filter it if the root hand is at right and the hand direction is pointing to the left
     if use_direction and (handedness == 0 and hand_root[0] > img_size[0] * filter_config.get("max_root_x_ratio", 3 / 4) and hand_direction[0] < 0):
-        return True, filter_log
+        to_filter = True
     # If it is right hand, we will filter it if the root hand is at left and the hand direction is pointing to the right
     if use_direction and (handedness == 1 and hand_root[0] < img_size[0] * filter_config.get("min_root_x_ratio", 1 / 4) and hand_direction[0] > 0):
-        return True, filter_log
+        to_filter = True
     
     # Save info to log
     filter_log["hand_bbox"] = hand_bbox
@@ -260,7 +270,9 @@ def hand_heurstic_filter(hand_landmarks, handedness, body_keypoints, img_size, u
     filter_log["wrist_kp_conf"] = wrist_kp_conf
     filter_log["hand_root_kp_conf"] = hand_root_kp_conf
     filter_log["hand_angle_diff"] = hand_angle_diff
-    return False, filter_log
+    filter_log["hand_root_dist"] = hand_root_dist
+    filter_log["to_filter"] = to_filter
+    return to_filter, filter_log
 
 
 def single_hand_classsify_mediapipe(image_patch, mediapipe_hands):
@@ -486,32 +498,43 @@ def hand_filtering(frame, hand_kpts_2d, handedness, body_keypoints, img_size, mp
     filter_logs = []
     
     for i in range(len(hand_kpts_2d)):
-        to_filter, filter_log = hand_heurstic_filter(hand_kpts_2d[i], handedness[i], body_keypoints, img_size, use_body_keypoints=True, use_area=True, use_edge=False, use_direction=True, use_hand_angle=True, filter_config=filter_config)
-        if to_filter:
-            continue
+        to_filter, filter_log = hand_heurstic_filter(
+            hand_kpts_2d[i], handedness[i], body_keypoints, img_size, 
+            use_body_keypoints=filter_config.get("use_body_keypoints", True), 
+            use_area=filter_config.get("use_area", True), 
+            use_edge=False,  # Not use in first filtering
+            use_direction=filter_config.get("use_direction", True), 
+            use_hand_angle=filter_config.get("use_hand_angle", True), 
+            use_hand_anchor=filter_config.get("use_hand_anchor", True), 
+            filter_config=filter_config)
         # Save filter log
         filter_logs.append(filter_log)
+        if to_filter:
+            continue
         pred_keypoints_2ds_filtered.append(hand_kpts_2d[i])
         handedness_filtered.append(handedness[i])
     hand_kpts_2d = pred_keypoints_2ds_filtered
     handedness = handedness_filtered
 
     # [DEBUG]: Visualize the filter log
-    area_str = ""
+    debug_str = ""
     # [DEBUG]: Draw the hand bbox
-    for filter_log in filter_logs:
+    for hand_idx, filter_log in enumerate(filter_logs):
         hand_bbox = filter_log["hand_bbox"]
         hand_bbox_center = filter_log["hand_bbox_center"]
         hand_bbox_area = filter_log["hand_bbox_full_area"]
         hand_root = filter_log["hand_root"]
         edge_ratio = filter_log["edge_ratio"]
+        # Put on text at right bottom corner
+        debug_str += "F|" if filter_log["to_filter"] else "P|"
+        debug_str += f" Hand {hand_idx} Area: {hand_bbox_area:.2f}, {hand_bbox_center[1]:.2f}, Edge Ratio: {edge_ratio:.2f}, Wrist Conf: {filter_log['wrist_kp_conf']:.2f}, Hand Root Conf: {filter_log['hand_root_kp_conf']:.2f}, Hand Angle Diff: {filter_log['hand_angle_diff']:.2f}, Hand Root Dist: {filter_log['hand_root_dist']:.2f}\n"
+        if filter_log["to_filter"]:
+            continue
         cv2.rectangle(frame, (int(hand_bbox[0]), int(hand_bbox[1])), (int(hand_bbox[2]), int(hand_bbox[3])), (255, 255, 255), 1)
         # Draw the hand direction by draw an arrow between hand root and hand direction
         hand_direction = hand_bbox_center * 2 - hand_root
         cv2.arrowedLine(frame, (int(hand_root[0]), int(hand_root[1])), (int(hand_direction[0]), int(hand_direction[1])), (255, 0, 0), 1)
-        # Put on text at right bottom corner
-        area_str += f"Hand {i} Area: {hand_bbox_area:.2f}, Center: {hand_bbox_center[0]:.2f}, {hand_bbox_center[1]:.2f}, Edge Ratio: {edge_ratio:.2f}, Wrist Conf: {filter_log['wrist_kp_conf']:.2f}, Hand Root Conf: {filter_log['hand_root_kp_conf']:.2f}, Hand Angle Diff: {filter_log['hand_angle_diff']:.2f}\n"
-
+        
     # Split text into lines and render each line separately
     font_scale = 0.7  # Reduced font size
     font_thickness = 2
@@ -522,9 +545,11 @@ def hand_filtering(frame, hand_kpts_2d, handedness, body_keypoints, img_size, mp
     y_pos = frame.shape[0] - 500
     
     # Render each line of text
-    for line in area_str.split('\n'):
+    color = (0, 0, 255) if debug_str.startswith("F|") else (0, 255, 0)
+    for line in debug_str.split('\n'):
         if line:  # Only render non-empty lines
-            cv2.putText(frame, line, (10, y_pos), font, font_scale, (0, 0, 255), font_thickness)
+            color = (0, 0, 255) if line.startswith("F|") else (0, 255, 0)
+            cv2.putText(frame, line, (10, y_pos), font, font_scale, color, font_thickness)
             y_pos += line_spacing
 
     ## 4.2. Calculate the similarity between the two hands if there are two hands
@@ -563,7 +588,16 @@ def hand_filtering(frame, hand_kpts_2d, handedness, body_keypoints, img_size, mp
     for i in range(len(hand_kpts_2d)):
         hand_landmarks = hand_kpts_2d[i]
         # Filter out based on heuristic
-        to_filter, filter_log = hand_heurstic_filter(hand_landmarks, handedness[i], body_keypoints, img_size, use_body_keypoints=False, use_area=False, use_edge=True, use_direction=False, use_hand_angle=False)
+        to_filter, filter_log = hand_heurstic_filter(
+            hand_landmarks, handedness[i], body_keypoints, img_size, 
+            use_body_keypoints=False, 
+            use_area=False, 
+            use_edge=True,  # Use in second filtering
+            use_direction=False, 
+            use_hand_angle=False, 
+            use_hand_anchor=False, 
+            filter_config=filter_config
+        )
         if to_filter:
             continue
         pred_keypoints_2ds_filtered.append(hand_kpts_2d[i])
@@ -595,7 +629,7 @@ def hand_filtering(frame, hand_kpts_2d, handedness, body_keypoints, img_size, mp
     return frame, hand_kpts_2d, handedness
 
 
-def raw_process(raw_data_folder):
+def raw_process(raw_data_folder, debug_vis=False):
     checkpoint = DEFAULT_CHECKPOINT
     video_path = os.path.join(raw_data_folder, "raw_data", "camera", "camera_0.mp4")
     body_detector = "regnety"  # "vitdet"
@@ -638,11 +672,6 @@ def raw_process(raw_data_folder):
 
     # keypoint detector
     cpm = ViTPoseModel(device)
-
-    # Image processing
-    # for i in range(1, 10):
-    #     frame = cv2.imread(f"/home/haonan/Project/hamer/example_data/ego_test_002.png")
-    #     process_image(model, model_cfg, detector, cpm, frame, device, args)
     # Read video
     frame_idx = 0
     if not os.path.exists(video_path):
@@ -674,7 +703,7 @@ def raw_process(raw_data_folder):
             frame_idx += 1
             continue
         debug_image_path = os.path.join(output_folder, "debug_images", f"frame_{frame_idx}")
-        kpts_vis_img_hammer, pred_keypoints_2ds_frame, handedness_frame, body_keypoints_list_frame = process_image(model, model_cfg, detector, cpm, frame, device, output_name=debug_image_path, debug_vis=True)
+        kpts_vis_img_hammer, pred_keypoints_2ds_frame, handedness_frame, body_keypoints_list_frame = process_image(model, model_cfg, detector, cpm, frame, device, output_name=debug_image_path, debug_vis=debug_vis)
         # Add to the output
         pred_keypoints_2ds_video.append(pred_keypoints_2ds_frame)
         handedness_video.append(handedness_frame)
@@ -685,29 +714,10 @@ def raw_process(raw_data_folder):
     pbar.close()
     cap.release()
     # Save landmarks
-    save_episode_data(frame_idxes, pred_keypoints_2ds_video, handedness_video, body_keypoints_list_video, output_path=os.path.join(output_folder, "camera_0_hamer_landmarks.json"))
+    save_episode_data(frame_idxes, pred_keypoints_2ds_video, handedness_video, body_keypoints_list_video, output_path=os.path.join(output_folder, "camera_0_landmarks.json"))
 
 
-def post_process(raw_hand_track_path, output_path):
-    filter_config = {
-        "use_area": True,
-        "use_edge": False,
-        "use_direction": True,
-        "use_body_keypoints": True,
-        "min_area_threshold": 2000,  # pixel square
-        "min_edge_ratio": 0.6,
-        "min_wrist_kp_conf": 70,  # Set between 70~80%
-        "min_hand_root_kp_conf": 70,  # Set between 70~80%
-        "max_wrist_hand_dist": 100,
-        "max_root_x_ratio": 3 / 4,
-        "min_root_x_ratio": 1 / 4,
-        "min_hand_distance": 0.2,
-        "max_hand_iou": 0.75,
-        "max_hand_angle_diff": 0.5,
-        "bottom_clip": 200,  # Clip out XX pixels from the bottom of the image
-    }
-    # Mediapipe hands
-    bottom_clip = filter_config.get("bottom_clip", 200)
+def post_process(raw_hand_track_path, output_path, debug_vis=False):
     mp_hands = mp.solutions.hands
     min_detection_confidence = 0.5
     min_tracking_confidence = 0.5
@@ -723,7 +733,7 @@ def post_process(raw_hand_track_path, output_path):
         min_tracking_confidence=min_tracking_confidence,
     )
     # Load raw hand track datas
-    raw_hand_track_file = os.path.join(Path(raw_hand_track_path).parent, "camera_0_hamer_landmarks.json")
+    raw_hand_track_file = os.path.join(Path(raw_hand_track_path).parent, "camera_0_landmarks.json")
     with open(raw_hand_track_file, "r") as f:
         raw_hand_track_data = json.load(f)
     # Load raw video
@@ -734,9 +744,41 @@ def post_process(raw_hand_track_path, output_path):
     # Get image size
     width, height = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     img_size = (width, height)
-    out_video_path = os.path.join(Path(output_path).parent, "camera_0_hamer_landmarks_filtered.mp4")
+    # Filter config
+    filter_config = {
+        "use_area": True,  # Filter out hand that are too small
+        "use_edge": True,  # Filter out hand that are too close to edge
+        "use_direction": True,  # Filter out hand that has wired direction, for example, right hand at left side of body pointing to right
+        "use_body_keypoints": True,  # Filter out hand that has low confidence wrist and hand root
+        "use_hand_anchor": True,  # Filter out hand that has large distance for hand root before and after reconstruction
+        "use_hand_angle": True,  # Filter out hand that has large angle between hand direction before and after reconstruction
+        # Area filter
+        "min_area_threshold": 0.001 * width * height,  # Pixel square
+        # Edge filter
+        "min_edge_ratio": 0.6,
+        # Direction filter
+        "max_root_x_ratio": 3 / 4,
+        "min_root_x_ratio": 1 / 4,
+        # Body keypoints filter
+        "min_wrist_kp_conf": 70,  # Set between 70~80%
+        "min_hand_root_kp_conf": 70,  # Set between 70~80%
+        "max_wrist_hand_dist": 0.1 * height,  # Pixel
+        # Hand similarity filter
+        "min_hand_distance": 0.2,  # Ratio
+        "max_hand_iou": 0.75,  # Ratio
+        # Hand anchor filter
+        "max_hand_root_dist": 0.08 * height,  # Pixel, Set between 0.08~0.1
+        # Hand angle filter
+        "max_hand_angle_diff": 0.5,  # Cosine of angle in radian
+        # "bottom_clip": 200,  # Clip out XX pixels from the bottom of the image
+        "bottom_clip": 0,  # Clip out XX pixels from the bottom of the image
+    }
+    # Mediapipe hands
+    bottom_clip = filter_config.get("bottom_clip", 200)
+    # Setup output video writer
+    out_video_path = os.path.join(Path(output_path).parent, "camera_0_landmarks_filtered.mp4")
     out_video = cv2.VideoWriter(out_video_path, cv2.VideoWriter_fourcc(*'mp4v'), 30, (width, height - bottom_clip))
-
+    # Process video
     pbar = tqdm(total=cap.get(cv2.CAP_PROP_FRAME_COUNT))
     for _frame_idx in range(int(cap.get(cv2.CAP_PROP_FRAME_COUNT))):
         ret, frame = cap.read()
@@ -744,17 +786,22 @@ def post_process(raw_hand_track_path, output_path):
             break
         if str(_frame_idx) not in raw_hand_track_data:
             continue
+        # if _frame_idx < 6042:
+        #     continue
+        # if _frame_idx > 6042 + 10:
+        #     break
         frame_data = raw_hand_track_data[str(_frame_idx)]
         hand_kpts_2d, handedness, body_keypoints = frame_data["landmarks"], frame_data["handedness"], frame_data["body_keypoints"]
         debug_image_path = os.path.join(Path(output_path).parent, "debug_images", f"frame_{_frame_idx}")
         # Perform filtering algorithm
         hand_kpts_2d = np.array(hand_kpts_2d)
         body_keypoints = np.array(body_keypoints[0]) if len(body_keypoints) > 0 else []
-        frame, hand_kpts_2d, handedness = hand_filtering(frame, hand_kpts_2d, handedness, body_keypoints, img_size, mp_hand_tracker_bk, filter_config, debug_vis=True, output_name=debug_image_path)
+        frame, hand_kpts_2d, handedness = hand_filtering(frame, hand_kpts_2d, handedness, body_keypoints, img_size, mp_hand_tracker_bk, filter_config, debug_vis=debug_vis, output_name=debug_image_path)
         # Add to the output
         frame_data["landmarks"] = [h.tolist() for h in hand_kpts_2d]
         frame_data["handedness"] = handedness
-        out_video.write(frame[:-bottom_clip, :])
+        frame_write = frame[:-bottom_clip, :] if bottom_clip > 0 else frame
+        out_video.write(frame_write)
         pbar.update(1)
     pbar.close()
     out_video.release()
@@ -765,13 +812,18 @@ def post_process(raw_hand_track_path, output_path):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--raw_data_folder", type=str, default="/home/haonan/Project/hamer/example_data/test_008")
+    parser.add_argument("--raw_data_folder", type=str, default="/home/haonan/Project/hamer/example_data/test_001")
     parser.add_argument("--redo_raw_process", action="store_true")
+    parser.add_argument("--debug_vis", action="store_true")
     args = parser.parse_args()
+    # debug_vis = args.debug_vis
+    # redo_raw_process = args.redo_raw_process
+    debug_vis = False
+    redo_raw_process = True
     # Generate raw data
     raw_data_folder = args.raw_data_folder
-    raw_hand_track_path = os.path.join(raw_data_folder, "handtrack", "camera_0_hamer_landmarks.json")
-    output_path = os.path.join(raw_data_folder, "handtrack", "camera_0_hamer_landmarks_filtered.json")
-    if args.redo_raw_process:
-        raw_process(raw_data_folder)
-    post_process(raw_hand_track_path, output_path)
+    raw_hand_track_path = os.path.join(raw_data_folder, "handtrack", "camera_0_landmarks.json")
+    output_path = os.path.join(raw_data_folder, "handtrack", "camera_0_landmarks_filtered.json")
+    if redo_raw_process:
+        raw_process(raw_data_folder, debug_vis=debug_vis)
+    post_process(raw_hand_track_path, output_path, debug_vis=debug_vis)
